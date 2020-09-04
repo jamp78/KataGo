@@ -14,13 +14,9 @@ struct ValueTargets {
   float loss;
   float noResult;
   float score;
+  bool hasLead;
+  float lead;
 
-  bool hasMctsUtility;
-  float mctsUtility1;
-  float mctsUtility4;
-  float mctsUtility16;
-  float mctsUtility64;
-  float mctsUtility256;
   ValueTargets();
   ~ValueTargets();
 };
@@ -55,25 +51,35 @@ struct FinishedGameData {
   Hash128 gameHash;
 
   double drawEquivalentWinsForWhite;
+  Player playoutDoublingAdvantagePla;
+  double playoutDoublingAdvantage;
   bool hitTurnLimit;
 
   //Metadata about how the game was initialized
   int numExtraBlack;
   int mode;
-  int modeMeta1;
-  int modeMeta2;
+  int beganInEncorePhase;
+  int usedInitialPosition;
 
   //If false, then we don't have these below vectors and ownership information
   bool hasFullData;
-  int dataXLen;
-  int dataYLen;
   std::vector<float> targetWeightByTurn;
   std::vector<PolicyTarget> policyTargetsByTurn;
   std::vector<ValueTargets> whiteValueTargetsByTurn;
-  int8_t* finalWhiteOwnership;
+  Color* finalFullArea;
+  Color* finalOwnership;
+  bool* finalSekiAreas;
+  float* finalWhiteScoring;
 
   std::vector<SidePosition*> sidePositions;
   std::vector<ChangedNeuralNet*> changedNeuralNets;
+
+  static constexpr int MODE_HINTPOS = 5;
+  static constexpr int MODE_NORMAL = 0;
+  static constexpr int MODE_CLEANUP_TRAINING = 1;
+  static constexpr int MODE_FORK = 2;
+  static constexpr int MODE_HANDICAP = 3;
+  static constexpr int MODE_SGFPOS = 4;
 
   FinishedGameData();
   ~FinishedGameData();
@@ -110,29 +116,31 @@ struct TrainingWriteBuffers {
 
   //Value targets and other metadata, from the perspective of the player to move
   //C0-3: Categorial game result, win,loss,noresult, and also score. Draw is encoded as some blend of win and loss based on drawEquivalentWinsForWhite.
-  //C4-7: MCTS win-loss-noresult estimate td-like target, lambda = 35/36, nowFactor = 1/36
-  //C8-11: MCTS win-loss-noresult estimate td-like target, lambda = 11/12, nowFactor = 1/12
-  //C12-15: MCTS win-loss-noresult estimate td-like target, lambda = 3/4, nowFactor = 1/4
-  //C16-19: MCTS win-loss-noresult estimate td-like target, lambda = 0, nowFactor = 1 (no-temporal-averaging MCTS search result)
+  //C4-7: MCTS win-loss-noresult estimate td-like target, lambda = 1 - 1/(1 + boardArea * 0.176)
+  //C8-11: MCTS win-loss-noresult estimate td-like target, lambda = 1 - 1/(1 + boardArea * 0.056)
+  //C12-15: MCTS win-loss-noresult estimate td-like target, lambda = 1 - 1/(1 + boardArea * 0.016)
+  //C16-19: MCTS win-loss-noresult estimate td-like target, lambda = 0 (so, actually just the immediate MCTS result).
 
   //C20: Actual final score, from the perspective of the player to move, adjusted for draw utility, zero if C27 is zero.
-  //C21: MCTS utility variance, 1->4 visits
-  //C22: MCTS utility variance, 4->16 visits
-  //C23: MCTS utility variance, 16->64 visits
-  //C24: MCTS utility variance, 64->256 visits
+  //C21: Lead in points, number of points to make the game fair, zero if C29 is zero.
+  //C22: Expected arrival time of WL variance.
+  //C23-24: Unused
 
   //C25 Weight multiplier for row as a whole
 
-  //C26 Weight assigned to the policy target
-  //C27 Weight assigned to the final board ownership target and score distr and bonus score targets. Most training rows will have this be 1, some will be 0.
+  //C26: Weight assigned to the policy target
+  //C27: Weight assigned to the final board ownership target and score distr targets. Most training rows will have this be 1, some will be 0.
   //C28: Weight assigned to the next move policy target
-  //C29-32: Weight assigned to the utilityvariance target C21-C24
-  //C33-35: Unused
+  //C29: Weight assigned to the lead target
+  //C30-32: Unused
+  //C33: Weight assigned to the future position targets valueTargetsNCHW C1-C2
+  //C34: Weight assigned to the area/territory target valueTargetsNCHW C4
+  //C35: Unused
 
   //C36-40: Precomputed mask values indicating if we should use historical moves 1-5, if we desire random history masking.
   //1 means use, 0 means don't use.
 
-  //C41-46: 128-bit hash identifying the game which should also be output in the SGF data.
+  //C41-46: 128-bit hash identifying the game, different rows from the same game share the same value.
   //Split into chunks of 22, 22, 20, 22, 22, 20 bits, little-endian style (since floats have > 22 bits of precision).
 
   //C47: Komi, adjusted for draw utility and points costed or paid so far, from the perspective of the player to move.
@@ -146,14 +154,19 @@ struct TrainingWriteBuffers {
   //C53: First turn of this game that was selfplay for training rather than initialization (e.g. handicap stones, random init of the starting board pos)
   //C54: Number of extra moves black got at the start (i.e. handicap games)
 
-  //C55-56: Game type, game typesource metadata
-  // 0 = normal self-play game. C51 unused
-  // 1 = encore-training game. C51 is the starting encore phase
-  //C57: 0 = normal, 1 = whole game was forked with an experimental move in the opening
-  //C58: 0 = normal, 1 = training sample was an isolated side position forked off of main game
+  //C55-56: Game type, how the game was initialized
+  //0 = normal self-play game.
+  //1 = cleanup-phase-training game. C56 is the starting encore phase
+  //2 = fork from another self-play game.
+  //3 = handicap game
+  //4 = sampled from an external SGF position (e.g. human data or other bots).
+  //5 = sampled from a hint position (e.g. blindspot training).
+
+  //C57: Contains some data but is actually redundant with C55.
+  //C58: Contains some data but is actually redundant with C55.
   //C59: Unused
   //C60: Number of visits in the search generating this row, prior to any reduction.
-  //C61: Unused
+  //C61: Number of bonus points the player to move will get onward from this point in the game
   //C62: Unused
   //C63: Unused
 
@@ -164,14 +177,14 @@ struct TrainingWriteBuffers {
   //making 2*dataXLen*dataYLen+2*EXTRA_SCORE_DISTR_RADIUS indices in total.
   //Index of the actual score is labeled with 100, the rest labeled with 0, from the perspective of the player to move.
   //Except in case of integer komi, the value can be split between two adjacent labels based on value of draw.
-  //Arbitrary if C26 has weight 0.
+  //Arbitrary if C27 has weight 0.
   NumpyBuffer<int8_t> scoreDistrN;
-  //Ranges from -30 to 30, 61 indices in total. Index of the number of bonus points the player to move will get onward from this point in the game
-  //is labeled with 1, the rest labeled with 0, from the perspective of the player to move.
-  NumpyBuffer<int8_t> selfBonusScoreN;
 
   //Spatial value-related targets
-  //C0 - Final board ownership (-1,0,1), from the perspective of the player to move. All 0 if C26 has weight 0.
+  //C0: Final board ownership [-1,1], from the perspective of the player to move. All 0 if C27 has weight 0.
+  //C1: Difference between ownership and naive area (such as due to seki). All 0 if C27 has weight 0.
+  //C2-3: Future board position a certain number of turns in the future. All 0 if C33 has weight 0.
+  //C4: Final board area/territory [-120,120]. All 0 if C34 has weight 0. Unlike ownership, takes into account group tax and scoring rules.
   NumpyBuffer<int8_t> valueTargetsNCHW;
 
   TrainingWriteBuffers(int inputsVersion, int maxRows, int numBinaryChannels, int numGlobalChannels, int dataXLen, int dataYLen);
@@ -191,7 +204,11 @@ struct TrainingWriteBuffers {
     const std::vector<PolicyTargetMove>* policyTarget1, //can be null
     const std::vector<ValueTargets>& whiteValueTargets,
     int whiteValueTargetsIdx, //index in whiteValueTargets corresponding to this turn.
-    int8_t* finalWhiteOwnership,
+    const Board* finalBoard,
+    Color* finalFullArea,
+    Color* finalOwnership,
+    float* finalWhiteScoring,
+    const std::vector<Board>* posHistForFutureBoards, //can be null
     bool isSidePosition,
     int numNeuralNetsBehindLatest,
     const FinishedGameData& data,
@@ -212,6 +229,7 @@ class TrainingDataWriter {
 
   void writeGame(const FinishedGameData& data);
   void flushIfNonempty();
+  bool flushIfNonempty(std::string& resultingFilename);
 
  private:
   std::string outputDir;
